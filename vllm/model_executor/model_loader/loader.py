@@ -642,15 +642,24 @@ class ServerlessLLMLoader(BaseModelLoader):
         )
         
         from vllm.distributed import get_tensor_model_parallel_rank
+        import uuid
         
         assert os.path.isdir(model_config.model)
 
         local_model_path = model_config.model
+        local_model_path = os.path.join(local_model_path, f"rank_{rank}")
         rank = get_tensor_model_parallel_rank()
         
-        # client = SllmStoreClient("localhost:8073")
+        tensor_index_path = os.path.join(local_model_path, "tensor_index.json")
+        with open(tensor_index_path, "r") as f:
+            tensor_index = json.load(f)
         
-        sllm_state_dict = load_dict(os.path.join(local_model_path, f"rank_{rank}", device_config.device))
+        device_uuid_map = get_device_uuid_map()
+        device_uuid = device_uuid_map[device_config.device]
+        replica_uuid = str(uuid.uuid4())
+        client = SllmStoreClient("localhost:8073")
+        
+        # sllm_state_dict = load_dict(os.path.join(local_model_path, f"rank_{rank}", device_config.device))
         
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
@@ -659,27 +668,45 @@ class ServerlessLLMLoader(BaseModelLoader):
                                           cache_config)
             state_dict = self._filter_subtensors(model.state_dict())
             
+            memory_ptrs = {device_uuid: []}
+            tensor_copy_chunks = {device_uuid: []}
+            for name, param in state_dict.items():
+                data_ptr = param.untyped_storage().data_ptr()
+                memory_ptrs[device_uuid].append(data_ptr)
+                
+                offset, size = tensor_index[name]
+                tensor_copy_chunks[device_uuid].append(
+                    (offset, size, 0)
+                )
+            cuda_memory_handles = get_cuda_memory_handles(memory_ptrs)    
             
-            for key in sllm_state_dict:
-                tensor = sllm_state_dict[key]
-                # If loading with LoRA enabled, additional padding may
-                # be added to certain parameters. We only load into a
-                # narrowed view of the parameter data.
-                param_data = state_dict[key].data
-                param_shape = state_dict[key].shape
-                for dim, size in enumerate(tensor.shape):
-                    if size < param_shape[dim]:
-                        param_data = param_data.narrow(dim, 0, size)
-                if tensor.shape != param_shape:
-                    logger.warning(
-                        "loading tensor of shape %s into "
-                        "parameter '%s' of shape %s", tensor.shape,
-                        key, param_shape)
-                param_data.copy_(tensor)
-                state_dict.pop(key)
-            if state_dict:
-                raise ValueError(
-                    f"Missing keys {tuple(state_dict)} in loaded state!")
+            ret = client.load_into_gpu(
+                local_model_path,
+                replica_uuid,
+                tensor_copy_chunks,
+                cuda_memory_handles,
+            )        
+            client.confirm_model_loaded(model_name_or_path, replica_uuid)
+            # for key in sllm_state_dict:
+            #     tensor = sllm_state_dict[key]
+            #     # If loading with LoRA enabled, additional padding may
+            #     # be added to certain parameters. We only load into a
+            #     # narrowed view of the parameter data.
+            #     param_data = state_dict[key].data
+            #     param_shape = state_dict[key].shape
+            #     for dim, size in enumerate(tensor.shape):
+            #         if size < param_shape[dim]:
+            #             param_data = param_data.narrow(dim, 0, size)
+            #     if tensor.shape != param_shape:
+            #         logger.warning(
+            #             "loading tensor of shape %s into "
+            #             "parameter '%s' of shape %s", tensor.shape,
+            #             key, param_shape)
+            #     param_data.copy_(tensor)
+            #     state_dict.pop(key)
+            # if state_dict:
+            #     raise ValueError(
+            #         f"Missing keys {tuple(state_dict)} in loaded state!")
         return model.eval()
 
     @staticmethod
