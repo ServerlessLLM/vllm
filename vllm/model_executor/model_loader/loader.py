@@ -418,7 +418,6 @@ class TensorizerLoader(BaseModelLoader):
             tensorizer_config=tensorizer_config,
         )
 
-
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -575,6 +574,157 @@ class ShardedStateLoader(BaseModelLoader):
                 state_dict_part,
                 os.path.join(path, filename),
             )
+
+class ServerlessLLMLoader(BaseModelLoader):
+    # DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        extra_config = ({} if load_config.model_loader_extra_config is None
+                        else load_config.model_loader_extra_config.copy())
+        # self.pattern = extra_config.pop("pattern", self.DEFAULT_PATTERN)
+        if extra_config:
+            raise ValueError(f"Unexpected extra config keys for load format "
+                             f"{load_config.load_format}: "
+                             f"{load_config.model_loader_extra_config.keys()}")
+
+    @staticmethod
+    def _filter_subtensors(
+            tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Filter out all tensors that share the same memory or a subset of the
+        memory of another tensor.
+        """
+        same_storage_groups = collections.defaultdict(list)
+        for key, tensor in tensors.items():
+            if tensor.numel():
+                ptr = tensor.untyped_storage().data_ptr()
+                same_storage_groups[tensor.device, ptr].append((key, tensor))
+
+        def get_end_ptr(tensor: torch.Tensor) -> int:
+            return tensor.view(-1)[-1].data_ptr() + tensor.element_size()
+
+        result = {}
+        for group in same_storage_groups.values():
+            for k, t in group:
+                a, b = t.data_ptr(), get_end_ptr(t)
+                for k2, t2 in group:
+                    if not t2.is_contiguous():
+                        continue
+                    a2, b2 = t2.data_ptr(), get_end_ptr(t2)
+                    if a < a2 or b2 < b:
+                        continue
+                    if a2 < a or b < b2 or not t.is_contiguous():
+                        break  # t2 covers strictly more memory than t.
+                    if k2 < k:
+                        # Same tensors, keep the one with the smaller key.
+                        break
+                else:
+                    result[k] = t
+        return result
+
+    def load_model(self, *, model_config: ModelConfig,
+                   device_config: DeviceConfig,
+                   lora_config: Optional[LoRAConfig],
+                   vision_language_config: Optional[VisionLanguageConfig],
+                   parallel_config: ParallelConfig,
+                   scheduler_config: SchedulerConfig,
+                   cache_config: CacheConfig) -> nn.Module:
+
+        from serverless_llm_store import load_dict
+        from serverless_llm_store.client import SllmStoreClient
+        from serverless_llm_store._C import (
+            save_tensors,
+            restore_tensors,
+            allocate_cuda_memory,
+            get_cuda_memory_handles,
+            get_device_uuid_map,
+        )
+        
+        from vllm.distributed import get_tensor_model_parallel_rank
+        
+        assert os.path.isdir(model_config.model)
+
+        local_model_path = model_config.model
+        rank = get_tensor_model_parallel_rank()
+        
+        # client = SllmStoreClient("localhost:8073")
+        
+        sllm_state_dict = load_dict(os.path.join(local_model_path, f"rank_{rank}", device_config.device))
+        
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config,
+                                          lora_config, vision_language_config,
+                                          cache_config)
+            state_dict = self._filter_subtensors(model.state_dict())
+            
+            
+            for key in sllm_state_dict:
+                tensor = sllm_state_dict[key]
+                # If loading with LoRA enabled, additional padding may
+                # be added to certain parameters. We only load into a
+                # narrowed view of the parameter data.
+                param_data = state_dict[key].data
+                param_shape = state_dict[key].shape
+                for dim, size in enumerate(tensor.shape):
+                    if size < param_shape[dim]:
+                        param_data = param_data.narrow(dim, 0, size)
+                if tensor.shape != param_shape:
+                    logger.warning(
+                        "loading tensor of shape %s into "
+                        "parameter '%s' of shape %s", tensor.shape,
+                        key, param_shape)
+                param_data.copy_(tensor)
+                state_dict.pop(key)
+            if state_dict:
+                raise ValueError(
+                    f"Missing keys {tuple(state_dict)} in loaded state!")
+        return model.eval()
+
+    @staticmethod
+    def save_model(
+        model: torch.nn.Module,
+        path: str,
+        pattern: Optional[str] = None,
+        max_size: Optional[int] = None,
+    ) -> None:
+        from vllm.distributed import get_tensor_model_parallel_rank
+        from serverless_llm_store._C import save_tensors
+        
+        # if pattern is None:
+        #     pattern = ShardedStateLoader.DEFAULT_PATTERN
+        rank = get_tensor_model_parallel_rank()
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        
+        # move all tensors to CPU
+        for key, tensor in state_dict.items():
+            state_dict[key] = tensor.cpu()
+        
+        tensor_names = list(state_dict.keys())
+        tensor_data_index = {}
+        for name, param in state_dict.items():
+            param_storage = param.untyped_storage()
+            data_ptr = param_storage.data_ptr()
+            size = param_storage.size()
+            tensor_data_index[name] = (data_ptr, size)
+        
+        print(tensor_data_index)
+        rank_path = os.path.join(path, f"rank_{rank}")
+        if not os.path.exists(rank_path):
+            os.makedirs(rank_path)
+        # save tensors
+        tensor_offsets = save_tensors(tensor_names, tensor_data_index, rank_path)
+        
+        # create tensor index
+        tensor_index = {}
+        for name, param in state_dict.items():
+            # name: offset, size
+            tensor_index[name] = (tensor_offsets[name], tensor_data_index[name][1], tuple(param.shape), tuple(param.stride()), str(param.dtype))
+
+        # save tensor index
+        with open(os.path.join(rank_path, "tensor_index.json"), "w") as f:
+            json.dump(tensor_index, f)
 
 
 class BitsAndBytesModelLoader(BaseModelLoader):
@@ -826,6 +976,9 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)
+    
+    if load_config.load_format == LoadFormat.SERVERLESS_LLM:
+        return ServerlessLLMLoader(load_config)
 
     if load_config.load_format == LoadFormat.BITSANDBYTES:
         return BitsAndBytesModelLoader(load_config)
