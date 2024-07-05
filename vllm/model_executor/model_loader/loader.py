@@ -647,7 +647,10 @@ class ServerlessLLMLoader(BaseModelLoader):
 
         local_model_path = model_config.model
         local_model_path = os.path.join(local_model_path, f"rank_{rank}")
-        
+        model_name = local_model_path.split("/")[-2:][0] + "/" + local_model_path.split("/")[-1]
+        ret = client.load_into_cpu(model_name)
+        if not ret or ret == False:
+            raise ValueError(f"Failed to load model {model_name} into CPU")
         
         tensor_index_path = os.path.join(local_model_path, "tensor_index.json")
         with open(tensor_index_path, "r") as f:
@@ -674,17 +677,11 @@ class ServerlessLLMLoader(BaseModelLoader):
                 memory_ptrs[rank].append(data_ptr)
                 offset, size, _, _, _ = tensor_index[name]
                 
+                # every tensor has its own base address, so GPU offset is always 0
                 tensor_copy_chunks[rank].append(
                     (offset, size, 0, idx)
                 )
             cuda_memory_handles = get_cuda_memory_handles(memory_ptrs)    
-            model_name = local_model_path.split("/")[-2:][0] + "/" + local_model_path.split("/")[-1]
-            
-            ret = client.load_into_cpu(model_name)
-            if not ret or ret == False:
-                raise ValueError(f"Failed to load model {model_name} into CPU")
-            
-            
             
             ret = client.load_into_gpu(
                 model_name,
@@ -695,26 +692,6 @@ class ServerlessLLMLoader(BaseModelLoader):
             if not ret or ret == False:
                 raise ValueError(f"Failed to load model {model_name} into GPU")
             client.confirm_model_loaded(model_name, replica_uuid)
-            # for key in sllm_state_dict:
-            #     tensor = sllm_state_dict[key]
-            #     # If loading with LoRA enabled, additional padding may
-            #     # be added to certain parameters. We only load into a
-            #     # narrowed view of the parameter data.
-            #     param_data = state_dict[key].data
-            #     param_shape = state_dict[key].shape
-            #     for dim, size in enumerate(tensor.shape):
-            #         if size < param_shape[dim]:
-            #             param_data = param_data.narrow(dim, 0, size)
-            #     if tensor.shape != param_shape:
-            #         logger.warning(
-            #             "loading tensor of shape %s into "
-            #             "parameter '%s' of shape %s", tensor.shape,
-            #             key, param_shape)
-            #     param_data.copy_(tensor)
-            #     state_dict.pop(key)
-            # if state_dict:
-            #     raise ValueError(
-            #         f"Missing keys {tuple(state_dict)} in loaded state!")
         return model.eval()
 
     @staticmethod
@@ -730,7 +707,7 @@ class ServerlessLLMLoader(BaseModelLoader):
         # if pattern is None:
         #     pattern = ShardedStateLoader.DEFAULT_PATTERN
         rank = get_tensor_model_parallel_rank()
-        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        state_dict = ServerlessLLMLoader._filter_subtensors(model.state_dict())
         
         # move all tensors to CPU
         for key, tensor in state_dict.items():
