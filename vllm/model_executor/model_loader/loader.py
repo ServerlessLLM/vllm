@@ -633,9 +633,9 @@ class ServerlessLLMLoader(BaseModelLoader):
         print("Loading model")
         from serverless_llm_store.client import SllmStoreClient
         from serverless_llm_store._C import (
-            restore_tensors,
             get_cuda_memory_handles,
             get_device_uuid_map,
+            get_device_ptrs_from_mem_handles,
         )
         
         from vllm.distributed import get_tensor_model_parallel_rank
@@ -643,14 +643,16 @@ class ServerlessLLMLoader(BaseModelLoader):
         
         assert os.path.isdir(model_config.model)
         
+        client = SllmStoreClient("localhost:8073")
         rank = get_tensor_model_parallel_rank()
 
         local_model_path = model_config.model
         local_model_path = os.path.join(local_model_path, f"rank_{rank}")
-        model_name = local_model_path.split("/")[-2:][0] + "/" + local_model_path.split("/")[-1]
+        model_name = "/".join(local_model_path.split("/")[-2:])
+        
         ret = client.load_into_cpu(model_name)
         if not ret or ret == False:
-            raise ValueError(f"Failed to load model {model_name} into CPU")
+            raise ValueError(f"Failed to load model {model_name} into CPU")  
         
         tensor_index_path = os.path.join(local_model_path, "tensor_index.json")
         with open(tensor_index_path, "r") as f:
@@ -659,7 +661,6 @@ class ServerlessLLMLoader(BaseModelLoader):
         device_uuid_map = get_device_uuid_map()
         device_uuid = device_uuid_map[rank]
         replica_uuid = str(uuid.uuid4())
-        client = SllmStoreClient("localhost:8073")
         
         # sllm_state_dict = load_dict(os.path.join(local_model_path, f"rank_{rank}", device_config.device))
         
@@ -672,16 +673,38 @@ class ServerlessLLMLoader(BaseModelLoader):
             
             memory_ptrs = {rank: []}
             tensor_copy_chunks = {rank: []}
+            
+            # idx = 0
+            # for name, param in model.named_parameters(recurse=True):
+            #     if not name in state_dict:
+            #         continue
+            #     data_ptr = param.data_ptr()
+            #     memory_ptrs[rank].append(data_ptr)
+                
+            #     offset, size, _, _, _ = tensor_index[name]
+            #     tensor_copy_chunks[rank].append((offset, size, 0, idx))
+            #     idx += 1
+            #     print(f"Loading tensor {name} with offset {offset} and size {size}, device {param.device}, {hex(data_ptr)}, {idx}")
+
             for idx, (name, param) in enumerate(state_dict.items()):
                 data_ptr = param.untyped_storage().data_ptr()
                 memory_ptrs[rank].append(data_ptr)
                 offset, size, _, _, _ = tensor_index[name]
-                
                 # every tensor has its own base address, so GPU offset is always 0
-                tensor_copy_chunks[rank].append(
-                    (offset, size, 0, idx)
-                )
-            cuda_memory_handles = get_cuda_memory_handles(memory_ptrs)    
+                tensor_copy_chunks[rank].append((offset, size, 0, idx))
+                print(f"Loading tensor {name} with offset {offset} and size {size}, device {param.device}, {hex(data_ptr)}, {idx}")
+            
+            cuda_memory_handles = get_cuda_memory_handles(memory_ptrs)
+            # device_ptrs = get_device_ptrs_from_mem_handles(cuda_memory_handles)
+            
+            # for k, ptr in enumerate(device_ptrs[rank]):
+            #     assert hex(ptr) == hex(memory_ptrs[rank][k]), f"Memory ptrs do not match: {hex(ptr)} != {hex(memory_ptrs[rank][k])}"
+            # cuda_memory_handles = {
+            #     rank: [
+            #         get_cuda_memory_handles({rank: ptr})[rank]
+            #         for ptr in memory_ptrs[rank]
+            #     ]
+            # }
             
             ret = client.load_into_gpu(
                 model_name,
@@ -702,41 +725,16 @@ class ServerlessLLMLoader(BaseModelLoader):
         max_size: Optional[int] = None,
     ) -> None:
         from vllm.distributed import get_tensor_model_parallel_rank
-        from serverless_llm_store._C import save_tensors
+        from serverless_llm_store import save_dict
         
-        # if pattern is None:
-        #     pattern = ShardedStateLoader.DEFAULT_PATTERN
         rank = get_tensor_model_parallel_rank()
         state_dict = ServerlessLLMLoader._filter_subtensors(model.state_dict())
         
         # move all tensors to CPU
         for key, tensor in state_dict.items():
             state_dict[key] = tensor.cpu()
-        
-        tensor_names = list(state_dict.keys())
-        tensor_data_index = {}
-        for name, param in state_dict.items():
-            param_storage = param.untyped_storage()
-            data_ptr = param_storage.data_ptr()
-            size = param_storage.size()
-            tensor_data_index[name] = (data_ptr, size)
-        
-        print(tensor_data_index)
-        rank_path = path + f"rank_{rank}" 
-        if not os.path.exists(rank_path):
-            os.makedirs(rank_path)
-        # save tensors
-        tensor_offsets = save_tensors(tensor_names, tensor_data_index, rank_path)
-        
-        # create tensor index
-        tensor_index = {}
-        for name, param in state_dict.items():
-            # name: offset, size
-            tensor_index[name] = (tensor_offsets[name], tensor_data_index[name][1], tuple(param.shape), tuple(param.stride()), str(param.dtype))
-
-        # save tensor index
-        with open(os.path.join(rank_path, "tensor_index.json"), "w") as f:
-            json.dump(tensor_index, f)
+            
+        save_dict(state_dict, os.path.join(path, f"rank_{rank}"))
 
 
 class BitsAndBytesModelLoader(BaseModelLoader):
