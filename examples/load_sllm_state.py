@@ -43,9 +43,14 @@ if __name__ == "__main__":
     llm = LLM(
         model=args.output,
         load_format="serverless_llm",
-        tensor_parallel_size=2,
+        # load_format="sharded_state",
+        gpu_memory_utilization=0.9,
+        distributed_executor_backend="mp",
+        max_model_len = 512,
+        tensor_parallel_size=args.tensor_parallel_size,
+        # num_gpu_blocks_override=128,
     )
     
-    input_text = "Hello, world!"
+    input_text = "Explain thread and process in python."
     
     print(llm.generate(input_text))
