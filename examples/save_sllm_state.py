@@ -46,12 +46,19 @@ parser.add_argument("--max-file-size",
 
 def main(args):
     engine_args = EngineArgs.from_cli_args(args)
+    engine_args.distributed_executor_backend = "mp"
+    engine_args.gpu_memory_utilization = 0.4
+    engine_args.max_seq_len_to_capture = 512
+    engine_args.max_model_len = 512
+    engine_args.max_num_seqs = 1
+    engine_args.num_gpu_blocks_override = 128
     if engine_args.enable_lora:
         raise ValueError("Saving with enable_lora=True is not supported!")
     model_path = engine_args.model
     if not Path(model_path).is_dir():
         raise ValueError("model path must be a local directory")
     # Create LLM instance from arguments
+    print(dataclasses.asdict(engine_args))
     llm = LLM(**dataclasses.asdict(engine_args))
     # Prepare output directory
     Path(args.output).mkdir(exist_ok=True)

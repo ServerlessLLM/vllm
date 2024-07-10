@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
+import gc
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoadFormat,
                          LoRAConfig, ModelConfig, ParallelConfig,
@@ -622,6 +623,7 @@ class ServerlessLLMLoader(BaseModelLoader):
                 else:
                     result[k] = t
         return result
+        
 
     def load_model(self, *, model_config: ModelConfig,
                    device_config: DeviceConfig,
@@ -630,9 +632,9 @@ class ServerlessLLMLoader(BaseModelLoader):
                    parallel_config: ParallelConfig,
                    scheduler_config: SchedulerConfig,
                    cache_config: CacheConfig) -> nn.Module:
-        print("Loading model")
         from serverless_llm_store.client import SllmStoreClient
         from serverless_llm_store import load_into_cpu_non_blocking, load_into_gpu_non_blocking, wait_dict_loaded
+        from serverless_llm_store import load_dict
         from serverless_llm_store._C import (
             get_cuda_memory_handles,
             get_device_uuid_map,
@@ -660,9 +662,6 @@ class ServerlessLLMLoader(BaseModelLoader):
             storage_path = storage_path + "models"
         device_map = {"": rank}
         
-        load_into_cpu_non_blocking(model_name, device_map, storage_path)
-        replica_uuid, sllm_state_dict, device_map = load_into_gpu_non_blocking(model_name, device_map, storage_path)
-        
         # tensor_index_path = os.path.join(local_model_path, "tensor_index.json")
         # with open(tensor_index_path, "r") as f:
         #     tensor_index = json.load(f)
@@ -672,26 +671,34 @@ class ServerlessLLMLoader(BaseModelLoader):
         # replica_uuid = str(uuid.uuid4())
         
         # sllm_state_dict = load_dict(os.path.join(local_model_path, f"rank_{rank}", device_config.device))
-        
         with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
+            # with torch.device(device_config.device):
+            with torch.device("cpu"):
                 model = _initialize_model(model_config, self.load_config,
                                         lora_config, vision_language_config,
                                         cache_config)
                 model = model.eval()
-                
             # set all parameters to meta device
             state_dict = self._filter_subtensors(model.state_dict())
             key_list = list(state_dict.keys())
             
             for key, param in model.named_parameters(recurse=True):
                 if key in key_list:
-                    param.data = torch.empty(1, device=torch.device("cuda"))
-            
+                    param.data = torch.empty(1, device="cuda")
+                    # print(f"{param.shape=}, {param.device=}")
+            gc.collect()
+            # for key in state_dict:
+            #     state_dict[key] = torch.empty(1, device="cuda")
             # model = dispatch_model(model, {"": torch.device("meta")})
-            torch.cuda.empty_cache()
+            
+            
+            # print cuda free memory
+            # print("Memory reserved ", torch.cuda.memory_reserved() / 1024 / 1024 / 1024, "GB")
+            load_into_cpu_non_blocking(model_name, device_map, storage_path)
+            replica_uuid, sllm_state_dict, device_map = load_into_gpu_non_blocking(model_name, device_map, storage_path)
             
             wait_dict_loaded(model_name, replica_uuid)
+            # sllm_state_dict = load_dict(model_name, device_map, storage_path)
             
             for key, param in model.named_parameters(recurse=True):
                 if key in key_list:
