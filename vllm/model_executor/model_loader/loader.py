@@ -576,6 +576,7 @@ class ShardedStateLoader(BaseModelLoader):
                 os.path.join(path, filename),
             )
 
+
 class ServerlessLLMLoader(BaseModelLoader):
     # DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 
@@ -624,7 +625,6 @@ class ServerlessLLMLoader(BaseModelLoader):
                     result[k] = t
         return result
         
-
     def load_model(self, *, model_config: ModelConfig,
                    device_config: DeviceConfig,
                    lora_config: Optional[LoRAConfig],
@@ -632,7 +632,7 @@ class ServerlessLLMLoader(BaseModelLoader):
                    parallel_config: ParallelConfig,
                    scheduler_config: SchedulerConfig,
                    cache_config: CacheConfig) -> nn.Module:
-        from serverless_llm_store import load_dict_single_device
+        from serverless_llm_store.torch import load_dict
         from vllm.distributed import get_tensor_model_parallel_rank
         
         assert os.path.isdir(model_config.model)
@@ -641,14 +641,24 @@ class ServerlessLLMLoader(BaseModelLoader):
 
         local_model_path = model_config.model
         local_model_path = os.path.join(local_model_path, f"rank_{rank}")
+
+        def remove_prefix(path, prefix):
+            # Normalize the paths to ensure consistency across different platforms
+            path = os.path.normpath(path)
+            prefix = os.path.normpath(prefix)
+            
+            # Check if the path starts with the prefix
+            if path.startswith(prefix):
+                # Return the path without the prefix
+                return path[len(prefix):].lstrip(os.sep)
+            
+            # Return the original path if the prefix doesn't exist
+            return path
         
-        # model name is everything after models
-        model_name = local_model_path.split("models/")[1]
-        storage_path = local_model_path.split("models/")[0]
-        if storage_path.endswith("/"):
-            storage_path = os.path.join(storage_path, "models")
-        else:
-            storage_path = storage_path + "models"
+        # vLLM needs a local model path to read model config but
+        # ServerlessLLM Store requires a global model path as the model ID
+        storage_path = os.getenv("STORAGE_PATH", "./models")
+        model_path = remove_prefix(local_model_path, storage_path)
         
         with set_default_torch_dtype(model_config.dtype):
             # with torch.device(device_config.device):
@@ -666,7 +676,10 @@ class ServerlessLLMLoader(BaseModelLoader):
                     param.data = torch.empty(1, device="cuda")
             gc.collect()
             
-            sllm_state_dict = load_dict_single_device(model_name, storage_path)
+            device_id = torch.cuda.current_device()
+            device_map = {"": device_id}
+            # Note: storage path is already included in the local model path
+            sllm_state_dict = load_dict(model_path, device_map)
             
             for key, param in model.named_parameters(recurse=True):
                 if key in key_list:
@@ -687,7 +700,7 @@ class ServerlessLLMLoader(BaseModelLoader):
         max_size: Optional[int] = None,
     ) -> None:
         from vllm.distributed import get_tensor_model_parallel_rank
-        from serverless_llm_store import save_dict
+        from serverless_llm_store.torch import save_dict
         
         rank = get_tensor_model_parallel_rank()
         state_dict = ServerlessLLMLoader._filter_subtensors(model.state_dict())
