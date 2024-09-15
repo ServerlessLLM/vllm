@@ -709,10 +709,11 @@ class ServerlessLLMLoader(BaseModelLoader):
         for key, tensor in state_dict.items():
             state_dict[key] = tensor.cpu().contiguous()
 
-        if not os.path.exists(path):
-            os.makedirs(path)
+        save_path = os.path.join(path, f"rank_{rank}")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
             
-        save_dict(state_dict, os.path.join(path, f"rank_{rank}"))
+        save_dict(state_dict, save_path)
 
 
 class BitsAndBytesModelLoader(BaseModelLoader):
